@@ -14,13 +14,12 @@ def time_it(label):
 
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import jax
 import jax.tree_util as jtu
 import jax.numpy as jnp
 import jax.scipy as jsp
-from scipy.io import loadmat, savemat
 
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from functools import partial
@@ -78,51 +77,64 @@ def value_and_grad_fn(params, X, y, flex_dict):
 
     grads = {}
     if flex_dict["ell"]:
-        log_ell, chol_ell, _ = get_log_h(
+        ell_inducing, ell, chol_ell = predict_h(
             params["white_ell"],
+            params["X_inducing"],
             X,
             ell=jnp.exp(params["ell_gp_log_ell"]),
             sigma=jnp.exp(params["ell_gp_log_sigma"]),
+            scalar=not flex_dict["ell"],
         )
+        log_ell_inducing = jnp.log(ell_inducing)
     else:
         chol_ell, _ = get_latent_chol(
-            X,
+            params["X_inducing"],
             ell=jnp.exp(params["ell_gp_log_ell"]),
             sigma=jnp.exp(params["ell_gp_log_sigma"]),
         )
-        log_ell = repeat_to_size(params["white_ell"], X.shape[0])
+        log_ell_inducing = repeat_to_size(
+            params["white_ell"], params["X_inducing"].shape[0]
+        )
 
     if flex_dict["sigma"]:
-        log_sigma, chol_sigma, _ = get_log_h(
+        sigma_inducing, sigma, chol_sigma = predict_h(
             params["white_sigma"],
+            params["X_inducing"],
             X,
             ell=jnp.exp(params["sigma_gp_log_ell"]),
             sigma=jnp.exp(params["sigma_gp_log_sigma"]),
+            scalar=not flex_dict["sigma"],
         )
+        log_sigma_inducing = jnp.log(sigma_inducing)
     else:
         chol_sigma, _ = get_latent_chol(
-            X,
+            params["X_inducing"],
             ell=jnp.exp(params["sigma_gp_log_ell"]),
             sigma=jnp.exp(params["sigma_gp_log_sigma"]),
         )
-        log_sigma = repeat_to_size(params["white_sigma"], X.shape[0])
+        log_sigma_inducing = repeat_to_size(
+            params["white_sigma"], params["X_inducing"].shape[0]
+        )
 
     if flex_dict["omega"]:
-        log_omega, chol_omega, _ = get_log_h(
+        omega_inducing, omega, chol_omega = predict_h(
             params["white_omega"],
+            params["X_inducing"],
             X,
             ell=jnp.exp(params["omega_gp_log_ell"]),
             sigma=jnp.exp(params["omega_gp_log_sigma"]),
+            scalar=not flex_dict["omega"],
         )
+        log_omega_inducing = jnp.log(omega_inducing)
     else:
         chol_omega, _ = get_latent_chol(
-            X,
+            params["X_inducing"],
             ell=jnp.exp(params["omega_gp_log_ell"]),
             sigma=jnp.exp(params["omega_gp_log_sigma"]),
         )
-        log_omega = repeat_to_size(params["white_omega"], X.shape[0])
-
-    (ell, omega, sigma) = jnp.exp(log_ell), jnp.exp(log_omega), jnp.exp(log_sigma)
+        log_omega_inducing = repeat_to_size(
+            params["white_omega"], params["X_inducing"].shape[0]
+        )
 
     K_f, aux = gibbs_k(X, X, ell, ell, sigma, sigma)
     K_y = add_to_diagonal(K_f, omega**2, 0.0)
@@ -158,14 +170,14 @@ def value_and_grad_fn(params, X, y, flex_dict):
 
     # Type - A - Prior on correlated parameters
     log_prior_ell = tfd.MultivariateNormalTriL(
-        loc=log_ell.mean(), scale_tril=chol_ell
-    ).log_prob(log_ell)
-    log_prior_omega = tfd.MultivariateNormalTriL(
-        loc=log_omega.mean(), scale_tril=chol_omega
-    ).log_prob(log_omega)
+        loc=log_ell_inducing.mean(), scale_tril=chol_ell
+    ).log_prob(log_ell_inducing)
     log_prior_sigma = tfd.MultivariateNormalTriL(
-        loc=log_sigma.mean(), scale_tril=chol_sigma
-    ).log_prob(log_sigma)
+        loc=log_sigma_inducing.mean(), scale_tril=chol_sigma
+    ).log_prob(log_sigma_inducing)
+    log_prior_omega = tfd.MultivariateNormalTriL(
+        loc=log_omega_inducing.mean(), scale_tril=chol_omega
+    ).log_prob(log_omega_inducing)
 
     # log_prior_ell += tfd.Normal(2.0, 2.0).log_prob(log_ell.mean())
     # log_prior_omega += tfd.Normal(2.0, 2.0).log_prob(log_omega.mean())
@@ -245,29 +257,38 @@ def value_and_grad_fn(params, X, y, flex_dict):
 
 
 def predict_fn(params, X, y, X_new, flex_dict):
-    ell, ell_new, _ = predict_h(
-        params["white_ell"],
-        X,
-        X_new,
-        ell=jnp.exp(params["ell_gp_log_ell"]),
-        sigma=jnp.exp(params["ell_gp_log_sigma"]),
-        scalar=not flex_dict["ell"],
+    ell, ell_new = jtu.tree_map(
+        lambda x: predict_h(
+            params["white_ell"],
+            params["X_inducing"],
+            x,
+            ell=jnp.exp(params["ell_gp_log_ell"]),
+            sigma=jnp.exp(params["ell_gp_log_sigma"]),
+            scalar=not flex_dict["ell"],
+        )[1],
+        (X, X_new),
     )
-    sigma, sigma_new, _ = predict_h(
-        params["white_sigma"],
-        X,
-        X_new,
-        ell=jnp.exp(params["sigma_gp_log_ell"]),
-        sigma=jnp.exp(params["sigma_gp_log_sigma"]),
-        scalar=not flex_dict["sigma"],
+    sigma, sigma_new = jtu.tree_map(
+        lambda x: predict_h(
+            params["white_sigma"],
+            params["X_inducing"],
+            x,
+            ell=jnp.exp(params["sigma_gp_log_ell"]),
+            sigma=jnp.exp(params["sigma_gp_log_sigma"]),
+            scalar=not flex_dict["sigma"],
+        )[1],
+        (X, X_new),
     )
-    omega, omega_new, _ = predict_h(
-        params["white_omega"],
-        X,
-        X_new,
-        ell=jnp.exp(params["omega_gp_log_ell"]),
-        sigma=jnp.exp(params["omega_gp_log_sigma"]),
-        scalar=not flex_dict["omega"],
+    omega, omega_new = jtu.tree_map(
+        lambda x: predict_h(
+            params["white_omega"],
+            params["X_inducing"],
+            x,
+            ell=jnp.exp(params["omega_gp_log_ell"]),
+            sigma=jnp.exp(params["omega_gp_log_sigma"]),
+            scalar=not flex_dict["omega"],
+        )[1],
+        (X, X_new),
     )
 
     K, _ = gibbs_k(X, X, ell, ell, sigma, sigma)
@@ -284,10 +305,10 @@ def predict_fn(params, X, y, X_new, flex_dict):
 
 #### data
 flex_dict = {"ell": 1, "omega": 1, "sigma": 1}
-
 # data = rd.MotorcycleHelmet
-# save_path = f"figures/{data.__name__}"
+# save_path = f"figures/inducing_{data.__name__}"
 # X, y, _ = data().get_data()
+
 ## pre-scale
 # X = MinMaxScaler().fit_transform(X)
 # tmp_yscale = jnp.max(jnp.abs(y - jnp.mean(y)))
@@ -295,7 +316,7 @@ flex_dict = {"ell": 1, "omega": 1, "sigma": 1}
 ######################################
 
 # X, y, fn_dict, _ = get_simulated_data(flex_scale=1, flex_noise=1, flex_var=1)
-# save_path = "figures/simulated"
+# save_path = "figures/inducing_simulated"
 
 ######################################
 X_key = jax.random.PRNGKey(0)
@@ -310,12 +331,9 @@ gen_flex_dict = {"ell": 1, "omega": 1, "sigma": 1}
 y, ell_true, sigma_true, omega_true = generate_heinonen_gp_data(
     X, latent_key, data_key, gen_flex_dict
 )
-save_path = f"figures/heinonen_gen_{latent_seed}_{data_seed}"
 
-savemat(
-    f"heinonen_gen_{latent_seed}_{data_seed}.mat",
-    {f"h_{latent_seed}_{data_seed}": {"X": X, "y": y.reshape(-1, 1)}},
-)
+n_inducing = int(jnp.log(X.shape[0])) + 1
+save_path = f"figures/inducing_heinonen_gen_{latent_seed}_{data_seed}_{n_inducing}"
 
 ## Normalize
 x_scaler = MinMaxScaler()
@@ -333,18 +351,24 @@ experiment_scale = 1
 
 
 def get_params(key):
-    keys = jax.random.split(key, 3)
+    keys = jax.random.split(key, 4)
     x_range = X.max() - X.min()
     x_std = X.std()
     y_range = y.max() - y.min()
     y_std = y.std()
+    inducing_keys = jax.random.split(keys[0], X.shape[1])
+    X_inducing = jax.vmap(
+        lambda key, x: jax.random.uniform(
+            key, shape=(n_inducing,), minval=x.min(), maxval=x.max()
+        )
+    )(inducing_keys, X.T).T
     params = {
         "white_ell": get_white(
             jax.random.uniform(
                 keys[0], minval=0.03 * experiment_scale, maxval=0.3 * experiment_scale
             ),
             # jnp.array(0.05) * 100,
-            X,
+            X_inducing,
             ell=0.2,
             sigma=1.0,
             scalar=not flex_dict["ell"],
@@ -353,7 +377,7 @@ def get_params(key):
             jax.random.uniform(
                 keys[1], minval=0.1 * experiment_scale, maxval=0.5 * experiment_scale
             ),
-            X,
+            X_inducing,
             ell=0.2,
             sigma=1.0,
             scalar=not flex_dict["sigma"],
@@ -363,7 +387,7 @@ def get_params(key):
             jax.random.uniform(
                 keys[2], minval=0.01 * experiment_scale, maxval=0.1 * experiment_scale
             ),
-            X,
+            X_inducing,
             ell=0.3,
             sigma=1.0,
             scalar=not flex_dict["omega"],
@@ -375,6 +399,7 @@ def get_params(key):
         "ell_gp_log_sigma": jnp.log(jnp.array(1.0)),
         "sigma_gp_log_sigma": jnp.log(jnp.array(1.0)),
         "omega_gp_log_sigma": jnp.log(jnp.array(1.0)),
+        "X_inducing": X_inducing,
     }
     return params
 
@@ -385,7 +410,7 @@ value_and_grad_fn = partial(value_and_grad_fn, X=X, y=y, flex_dict=flex_dict)
 
 time_it("Setup done")
 
-params = jax.vmap(get_params)(jax.random.split(jax.random.PRNGKey(1003), 10))
+params = jax.vmap(get_params)(jax.random.split(jax.random.PRNGKey(1000), 10))
 partial_train_fn = partial(
     train_fn, loss_fn=value_and_grad_fn, optimizer=optax.adam(0.01), n_iters=2500
 )
@@ -403,8 +428,6 @@ plt.figure(figsize=(10, 3))
 plt.plot(result["loss_history"])
 plt.savefig(f"{save_path}_loss.png")
 
-
-fig, ax = plt.subplots(1, 1, figsize=(15, 3))
 time_it("Plotting loss done")
 
 value_and_grad_fn(result["raw_params"])  # To check final loss breakdown
@@ -432,6 +455,7 @@ time_it("Prediction done")
 # Denormalize
 X = x_scaler.inverse_transform(X)
 X_test = x_scaler.inverse_transform(X_test)
+X_inducing = x_scaler.inverse_transform(result["raw_params"]["X_inducing"])
 y = y * yscale + ymean
 pred_mean = pred_mean * yscale + ymean
 pred_cov = pred_cov * yscale**2
@@ -441,6 +465,7 @@ pred_sigma = pred_sigma * yscale
 pred_omega = pred_omega * yscale
 #########################################
 
+fig, ax = plt.subplots(1, 1, figsize=(15, 3))
 ax.scatter(X, y, label="data")
 ax.plot(X_test, pred_mean, label="mean")
 ax.fill_between(
@@ -457,6 +482,8 @@ ax.fill_between(
     alpha=0.5,
     label="2 std + noise",
 )
+for each in X_inducing.ravel():
+    ax.axvline(each, color="k", linestyle="--", alpha=0.5)
 ax.legend()
 fig.savefig(f"{save_path}_posterior.png")
 
@@ -473,6 +500,8 @@ fig, ax = plt.subplots(1, 1, figsize=(15, 3))
 ax.plot(X_test, pred_ell, label="ell", color="r")
 ax.plot(X_test, pred_sigma, label="sigma", color="g")
 ax.plot(X_test, pred_omega, label="omega", color="b")
+for each in X_inducing.ravel():
+    ax.axvline(each, color="k", linestyle="--", alpha=0.5)
 
 if "ell_true" in locals():
     ax.plot(

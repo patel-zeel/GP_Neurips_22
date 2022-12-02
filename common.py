@@ -39,7 +39,7 @@ dist_f = jax.vmap(dist_f, in_axes=(0, None))
 
 def get_log_normal(desired_mode):
     log_mode = jnp.log(desired_mode)
-    mu = -1.0
+    mu = 0.0
     scale = jnp.sqrt(mu - log_mode)
     return tfd.LogNormal(loc=mu, scale=scale)
 
@@ -52,10 +52,13 @@ def get_latent_chol(X, ell, sigma):
     return chol, kernel_fn
 
 
-def get_white(h, X, ell, sigma):
+def get_white(h, X, ell, sigma, scalar=False):
     log_h = jnp.log(repeat_to_size(h, X.shape[0]))
-    chol, _ = get_latent_chol(X, ell, sigma)
-    return st(chol, log_h, lower=True)
+    if scalar:
+        return log_h[0]
+    else:
+        chol, _ = get_latent_chol(X, ell, sigma)
+        return st(chol, log_h, lower=True)
 
 
 def get_log_h(white_h, X, ell, sigma):
@@ -63,12 +66,22 @@ def get_log_h(white_h, X, ell, sigma):
     return chol @ white_h, chol, kernel_fn
 
 
-def predict_h(white_h, X, X_new, ell, sigma):
-    log_h, chol, kernel_fn = get_log_h(white_h, X, ell, sigma)
-    K_star = kernel_fn(X_new, X)
-    return jnp.exp(log_h), jnp.exp(
-        log_h.mean() + K_star @ cs((chol, True), log_h - log_h.mean())
-    )
+def predict_h(white_h, X, X_new, ell, sigma, scalar=False):
+    if scalar:
+        chol, _ = get_latent_chol(X, ell, sigma)
+        return (
+            jnp.exp(repeat_to_size(white_h, X.shape[0])),
+            jnp.exp(repeat_to_size(white_h, X_new.shape[0])),
+            chol,
+        )
+    else:
+        log_h, chol, kernel_fn = get_log_h(white_h, X, ell, sigma)
+        K_star = kernel_fn(X_new, X)
+        return (
+            jnp.exp(log_h),
+            jnp.exp(log_h.mean() + K_star @ cs((chol, True), log_h - log_h.mean())),
+            chol,
+        )
 
 
 def gibbs_k(X1, X2, ell1, ell2, s1, s2):
@@ -82,19 +95,29 @@ def gibbs_k(X1, X2, ell1, ell2, s1, s2):
     return variance * prefix_part * exp_part, locals()
 
 
-def generate_heinonen_gp_data(X, latent_key, data_key):
-    ell_chol, _ = get_latent_chol(X, ell=0.2, sigma=1.0)
-    sigma_chol, _ = get_latent_chol(X, ell=0.2, sigma=1.0)
-    omega_chol, _ = get_latent_chol(X, ell=0.3, sigma=1.0)
-
+def generate_heinonen_gp_data(X, latent_key, data_key, flex_dict):
     white_ell, white_sigma, white_omega = jax.random.normal(
         latent_key, shape=(3, X.shape[0])
     )
 
-    # generate hyperparameters with zero mean
-    log_ell = ell_chol @ white_ell
-    log_sigma = sigma_chol @ white_sigma
-    log_omega = omega_chol @ white_omega
+    ell_chol, _ = get_latent_chol(X, ell=0.2, sigma=1.0)
+    if flex_dict["ell"]:
+        log_ell = ell_chol @ white_ell
+    else:
+        log_ell = repeat_to_size(white_ell[0], X.shape[0])
+
+    sigma_chol, _ = get_latent_chol(X, ell=0.2, sigma=1.0)
+
+    if flex_dict["sigma"]:
+        log_sigma = sigma_chol @ white_sigma
+    else:
+        log_sigma = repeat_to_size(white_sigma[0], X.shape[0])
+
+    omega_chol, _ = get_latent_chol(X, ell=0.2, sigma=1.0)
+    if flex_dict["omega"]:
+        log_omega = omega_chol @ white_omega
+    else:
+        log_omega = repeat_to_size(white_omega[0], X.shape[0])
 
     cov, _ = gibbs_k(
         X, X, jnp.exp(log_ell), jnp.exp(log_ell), jnp.exp(log_sigma), jnp.exp(log_sigma)
